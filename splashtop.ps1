@@ -2,7 +2,7 @@ $ErrorActionPreference = 'Stop'
 
 $DownloadUrl = "https://www.dropbox.com/scl/fi/youolaff4q0rk6f1ow5oc/Splashtop_Streamer_Windows_DEPLOY_INSTALLER_v3.8.0.4_AXR25ZRHJ7Y4.msi?rlkey=ar3txo7ni5nqm3rcreuidcxmt&st=c7j132sn&dl=1"
 
-$BaseDir   = Join-Path $env:ProgramData "SplashtopDeploy"
+$BaseDir = "C:\ProgramData\Supreme\Installers\Splashtop"
 $Installer = Join-Path $BaseDir "streamer.msi"
 $LogDir    = Join-Path $BaseDir "Logs"
 $MsiLog    = Join-Path $LogDir "msi.log"
