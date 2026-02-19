@@ -1,0 +1,142 @@
+$ErrorActionPreference = 'Stop'
+
+$Url     = "https://www.dropbox.com/scl/fi/youolaff4q0rk6f1ow5oc/Splashtop_Streamer_Windows_DEPLOY_INSTALLER_v3.8.0.4_AXR25ZRHJ7Y4.msi?rlkey=ar3txo7ni5nqm3rcreuidcxmt&st=c7j132sn&dl=1"
+$BaseDir = "C:\ProgramData\Supreme\Installers\Splashtop"
+$MsiPath = Join-Path $BaseDir "streamer.msi"
+$LogDir  = Join-Path $BaseDir "Logs"
+$RunLog  = Join-Path $LogDir  "run.log"
+$MsiLog  = Join-Path $LogDir  "msi_install.log"
+$UnLog   = Join-Path $LogDir  "msi_uninstall.log"
+
+New-Item -Path $LogDir -ItemType Directory -Force | Out-Null
+
+function Log([string]$m) {
+  "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $m" | Out-File -FilePath $RunLog -Append -Encoding utf8
+}
+
+function Find-SplashtopService {
+  # Prefer exact known names if you know them; otherwise fall back to pattern match.
+  $known = @(
+    "SplashtopRemoteService",
+    "SRService"
+  )
+  foreach ($n in $known) {
+    $svc = Get-Service -Name $n -ErrorAction SilentlyContinue
+    if ($svc) { return $svc }
+  }
+
+  return (Get-Service -ErrorAction SilentlyContinue | Where-Object {
+    $_.Name -match 'splashtop|srservice' -or $_.DisplayName -match 'splashtop|streamer'
+  } | Select-Object -First 1)
+}
+
+function Test-ServiceHealth {
+  $svc = Find-SplashtopService
+  if (-not $svc) {
+    Log "Health: Splashtop service not found."
+    return $false
+  }
+
+  Log "Health: Found service Name=$($svc.Name) DisplayName=$($svc.DisplayName) Status=$($svc.Status)"
+
+  if ($svc.Status -ne 'Running') {
+    try {
+      Start-Service -Name $svc.Name -ErrorAction Stop
+      Start-Sleep -Seconds 3
+      $svc.Refresh()
+      Log "Health: After start attempt Status=$($svc.Status)"
+    } catch {
+      Log "Health: Service failed to start: $($_.Exception.Message)"
+      return $false
+    }
+  }
+
+  if ($svc.Status -ne 'Running') {
+    Log "Health: Service is not running."
+    return $false
+  }
+
+  # Optional: verify ImagePath points to an existing EXE (catches “registered but missing files”)
+  try {
+    $img = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\$($svc.Name)" -Name ImagePath -ErrorAction Stop).ImagePath
+    $exe = $img.Trim('"')
+    if ($exe -match '^\s*("?)([^"]+?\.exe)\1') { $exe = $Matches[2] }
+    if (-not (Test-Path $exe)) {
+      Log "Health: Service ImagePath EXE missing: $exe"
+      return $false
+    }
+    Log "Health: Service EXE exists: $exe"
+  } catch {
+    Log "Health: Could not read ImagePath (continuing)."
+  }
+
+  Log "Health: OK (service running)."
+  return $true
+}
+
+function Get-SplashtopProductCodes {
+  $paths = @(
+    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+  )
+  $codes = @()
+
+  foreach ($p in $paths) {
+    Get-ItemProperty -Path $p -ErrorAction SilentlyContinue |
+      Where-Object {
+        ($_.DisplayName -and $_.DisplayName -like "*Splashtop*") -or
+        ($_.Publisher    -and $_.Publisher    -like "*Splashtop*")
+      } |
+      ForEach-Object {
+        $keyName = $_.PSChildName
+        if ($keyName -match '^\{[0-9A-Fa-f\-]{36}\}$') { $codes += $keyName }
+        elseif ($_.UninstallString -match '\{[0-9A-Fa-f\-]{36}\}') { $codes += $Matches[0] }
+      }
+  }
+
+  $codes | Sort-Object -Unique
+}
+
+try {
+  Log "User=$env:USERNAME TEMP=$env:TEMP"
+
+  # Health gate: if service is good, do nothing
+  if (Test-ServiceHealth) {
+    exit 0
+  }
+
+  $msiexec = Join-Path $env:WINDIR "System32\msiexec.exe"
+  Log "Using msiexec -> $msiexec"
+
+  # Uninstall existing Splashtop products (your previous behavior)
+  $productCodes = Get-SplashtopProductCodes
+  if ($productCodes.Count -gt 0) {
+    Log "Found existing Splashtop products: $($productCodes -join ', ')"
+    foreach ($code in $productCodes) {
+      Log "Uninstalling -> $code"
+      $unArgs = "/x $code /qn /norestart /l*v `"$UnLog`""
+      $pUn = Start-Process -FilePath $msiexec -ArgumentList $unArgs -Wait -PassThru
+      Log "Uninstall exit code for $code -> $($pUn.ExitCode)"
+    }
+  } else {
+    Log "No existing Splashtop installation detected."
+  }
+
+  # Download MSI
+  New-Item -Path $BaseDir -ItemType Directory -Force | Out-Null
+  Log "Downloading -> $MsiPath"
+  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+  Invoke-WebRequest -Uri $Url -OutFile $MsiPath -UseBasicParsing
+
+  # Install
+  $args = "/i `"$MsiPath`" /qn /norestart USERINFO=`"hidewindow=1,confirm_d=0`" /l*v `"$MsiLog`""
+  Log "Installing -> $msiexec $args"
+  $p = Start-Process -FilePath $msiexec -ArgumentList $args -Wait -PassThru
+  Log "Install exit code -> $($p.ExitCode)"
+
+  exit $p.ExitCode
+}
+catch {
+  Log "ERROR: $($_.Exception.Message)"
+  exit 1
+}
