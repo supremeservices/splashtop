@@ -1,12 +1,14 @@
-# Splashtop Streamer – Safe Remediation Script
-# - Only remediates broken installs
-# - Health = Streamer service exists + running + binary exists
+# Splashtop Streamer – Remediation Script (service-gated)
+# Rule:
+# - If SplashtopRemoteService exists and is Running -> assume healthy, exit 0
+# - Else -> uninstall Splashtop Streamer MSI product(s) + install target MSI
+# Notes:
 # - Forces 64-bit msiexec (Sysnative-safe)
-# - Logs to ProgramData
+# - Logs to C:\ProgramData\Supreme\Installers\Splashtop\Logs
 
 $ErrorActionPreference = 'Stop'
 
-# ==== CONFIG ====
+$ServiceName = "SplashtopRemoteService"
 $DownloadUrl = "https://www.dropbox.com/scl/fi/youolaff4q0rk6f1ow5oc/Splashtop_Streamer_Windows_DEPLOY_INSTALLER_v3.8.0.4_AXR25ZRHJ7Y4.msi?dl=1"
 
 $BaseDir = "C:\ProgramData\Supreme\Installers\Splashtop"
@@ -18,137 +20,126 @@ $UnLog   = Join-Path $LogDir  "msi_uninstall.log"
 
 New-Item -Path $LogDir -ItemType Directory -Force | Out-Null
 
-# ==== LOGGING ====
-function Log($msg) {
-    "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $msg" |
-        Out-File -FilePath $RunLog -Append -Encoding utf8
+function Log([string]$msg) {
+  "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $msg" |
+    Out-File -FilePath $RunLog -Append -Encoding utf8
 }
 
-# ==== FORCE 64-BIT MSIEXEC ====
 function Get-MsiExec64 {
-    if (-not [Environment]::Is64BitProcess -and [Environment]::Is64BitOperatingSystem) {
-        return "$env:WINDIR\Sysnative\msiexec.exe"
-    }
-    return "$env:WINDIR\System32\msiexec.exe"
+  if (-not [Environment]::Is64BitProcess -and [Environment]::Is64BitOperatingSystem) {
+    return "$env:WINDIR\Sysnative\msiexec.exe"
+  }
+  return "$env:WINDIR\System32\msiexec.exe"
 }
 
-# ==== FIND STREAMER SERVICE ====
-function Get-StreamerService {
-    Get-Service -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.Name -match 'splashtop|srservice' -or
-            $_.DisplayName -match 'splashtop|streamer'
-        } |
-        Select-Object -First 1
-}
+function Test-ServiceHealthy([string]$name) {
+  $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+  if (-not $svc) {
+    Log "Health: Service '$name' not found."
+    return $false
+  }
 
-# ==== HEALTH CHECK ====
-function Test-StreamerHealthy {
-    $svc = Get-StreamerService
-    if (-not $svc) {
-        Log "Health: Streamer service not found."
-        return $false
-    }
+  Log "Health: Service '$name' found. Status=$($svc.Status) StartType=$($svc.StartType)"
 
-    Log "Health: Found service $($svc.Name) ($($svc.Status))"
-
-    if ($svc.Status -ne 'Running') {
-        try {
-            Start-Service -Name $svc.Name -ErrorAction Stop
-            Start-Sleep 3
-            $svc.Refresh()
-        } catch {
-            Log "Health: Service failed to start."
-            return $false
-        }
-    }
-
-    if ($svc.Status -ne 'Running') {
-        Log "Health: Service not running after start."
-        return $false
-    }
-
-    # Verify service binary exists
+  if ($svc.Status -ne 'Running') {
     try {
-        $img = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\$($svc.Name)" -Name ImagePath).ImagePath
-        $exe = ($img -replace '^"|"$','').Split(' ')[0]
-        if (-not (Test-Path $exe)) {
-            Log "Health: Service EXE missing: $exe"
-            return $false
-        }
+      Start-Service -Name $name -ErrorAction Stop
+      Start-Sleep -Seconds 3
+      $svc.Refresh()
+      Log "Health: After start attempt, Status=$($svc.Status)"
     } catch {
-        Log "Health: Unable to read service ImagePath."
-        return $false
+      Log "Health: Failed to start service '$name': $($_.Exception.Message)"
+      return $false
     }
+  }
 
-    Log "Health: Streamer healthy."
-    return $true
+  if ($svc.Status -ne 'Running') {
+    Log "Health: Service '$name' is not running."
+    return $false
+  }
+
+  return $true
 }
 
-# ==== FIND SPLASHTOP PRODUCT CODES ====
-function Get-SplashtopProductCodes {
-    $paths = @(
-        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
-        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
-    )
+function Get-SplashtopStreamerProductCodes {
+  # Only target Streamer entries, not all Splashtop products
+  $paths = @(
+    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+  )
 
-    $codes = @()
+  $codes = @()
 
-    foreach ($p in $paths) {
-        Get-ItemProperty $p -ErrorAction SilentlyContinue |
-            Where-Object { $_.DisplayName -match 'Splashtop.*Streamer' } |
-            ForEach-Object {
-                if ($_.PSChildName -match '^\{[A-F0-9\-]{36}\}$') {
-                    $codes += $_.PSChildName
-                }
-                elseif ($_.UninstallString -match '\{[A-F0-9\-]{36}\}') {
-                    $codes += $Matches[0]
-                }
-            }
-    }
+  foreach ($p in $paths) {
+    Get-ItemProperty -Path $p -ErrorAction SilentlyContinue |
+      Where-Object { $_.DisplayName -match 'Splashtop.*Streamer' } |
+      ForEach-Object {
+        $keyName = $_.PSChildName
+        Log "Uninstall entry: '$($_.DisplayName)' Version='$($_.DisplayVersion)' Key='$keyName'"
 
-    $codes | Sort-Object -Unique
+        # If the key name is a GUID, that's typically the ProductCode
+        if ($keyName -match '^\{[0-9A-Fa-f\-]{36}\}$') {
+          $codes += $keyName
+        }
+        elseif ($_.UninstallString -match '\{[0-9A-Fa-f\-]{36}\}') {
+          $codes += $Matches[0]
+        }
+      }
+  }
+
+  $codes | Sort-Object -Unique
 }
 
-# ==== MAIN ====
 try {
-    Log "Starting. User=$env:USERNAME"
+  Log "Starting. User=$env:USERNAME Computer=$env:COMPUTERNAME"
 
-    if (Test-StreamerHealthy) {
-        Log "No action needed. Exiting."
-        exit 0
-    }
-
-    Log "Streamer unhealthy. Remediation required."
-
-    $msiexec = Get-MsiExec64
-    Log "Using msiexec: $msiexec"
-
-    # Uninstall broken installs
-    $codes = Get-SplashtopProductCodes
-    foreach ($code in $codes) {
-        Log "Uninstalling $code"
-        Start-Process -FilePath $msiexec `
-            -ArgumentList "/x $code /qn /norestart /l*v `"$UnLog`"" `
-            -Wait
-    }
-
-    # Download MSI
-    New-Item -Path $BaseDir -ItemType Directory -Force | Out-Null
-    Log "Downloading MSI"
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    Invoke-WebRequest -Uri $DownloadUrl -OutFile $MsiPath -UseBasicParsing
-
-    # Install
-    Log "Installing Streamer"
-    Start-Process -FilePath $msiexec `
-        -ArgumentList "/i `"$MsiPath`" /qn /norestart /l*v `"$MsiLog`"" `
-        -Wait
-
-    Log "Install completed."
+  # 0) Health gate (ONLY this service)
+  if (Test-ServiceHealthy $ServiceName) {
+    Log "Health: OK (service running). No action taken."
     exit 0
+  }
+
+  Log "Health: NOT OK. Proceeding with remediation (uninstall + install)."
+
+  $msiexec = Get-MsiExec64
+  Log "Using 64-bit msiexec -> $msiexec"
+
+  # 1) Uninstall Streamer (if present)
+  $codes = Get-SplashtopStreamerProductCodes
+  if ($codes.Count -eq 0) {
+    Log "Uninstall: No Splashtop Streamer ProductCode found. Continuing to install anyway."
+  } else {
+    Log "Uninstall: ProductCodes=[$($codes -join ', ')]"
+    foreach ($code in $codes) {
+      Log "Uninstalling -> $code"
+      $pUn = Start-Process -FilePath $msiexec -ArgumentList "/x $code /qn /norestart /l*v `"$UnLog`"" -Wait -PassThru
+      Log "Uninstall exit code for $code -> $($pUn.ExitCode)"
+    }
+  }
+
+  # 2) Download MSI
+  New-Item -Path $BaseDir -ItemType Directory -Force | Out-Null
+  Log "Downloading -> $MsiPath"
+  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+  Invoke-WebRequest -Uri $DownloadUrl -OutFile $MsiPath -UseBasicParsing
+  Log "Downloaded size -> $((Get-Item $MsiPath).Length) bytes"
+
+  # 3) Install
+  $args = "/i `"$MsiPath`" /qn /norestart USERINFO=`"hidewindow=1,confirm_d=0`" /l*v `"$MsiLog`""
+  Log "Installing -> $msiexec $args"
+  $p = Start-Process -FilePath $msiexec -ArgumentList $args -Wait -PassThru
+  Log "Install exit code -> $($p.ExitCode)"
+
+  # 4) Post-check
+  if (Test-ServiceHealthy $ServiceName) {
+    Log "Post-check: Service running. Success."
+    exit 0
+  } else {
+    Log "Post-check: Service still not running. Treating as failure."
+    exit 1
+  }
 }
 catch {
-    Log "ERROR: $($_.Exception.Message)"
-    exit 1
+  Log "ERROR: $($_.Exception.Message)"
+  exit 1
 }
