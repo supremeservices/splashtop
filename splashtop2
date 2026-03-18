@@ -1,4 +1,6 @@
+
 # Splashtop Streamer deploy: uninstall broken/old installs first, then install
+# - Uses BITS for reliable download
 # - Runs as SYSTEM fine
 # - Forces 64-bit msiexec (System32)
 # - Logs everything to ProgramData\Supreme\Installers\Splashtop\Logs
@@ -16,7 +18,9 @@ $UnLog   = Join-Path $LogDir  "msi_uninstall.log"
 New-Item -Path $LogDir -ItemType Directory -Force | Out-Null
 
 function Log([string]$m) {
-  "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $m" | Out-File -FilePath $RunLog -Append -Encoding utf8
+  $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $m"
+  $line | Out-File -FilePath $RunLog -Append -Encoding utf8
+  Write-Host $line
 }
 
 function Get-SplashtopProductCodes {
@@ -52,7 +56,7 @@ try {
   $msiexec = Join-Path $env:WINDIR "System32\msiexec.exe"
   Log "Using msiexec -> $msiexec"
 
-  # 0) Check if Splashtop service is already running
+  # 0) Service check
   $serviceName = "SplashtopRemoteService"
   $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
 
@@ -71,7 +75,7 @@ try {
     Log "Splashtop service not found. Proceeding with install."
   }
 
-  # 1) Uninstall any existing Splashtop MSI products (handles broken installs)
+  # 1) Uninstall existing installs
   $productCodes = Get-SplashtopProductCodes
   if ($productCodes.Count -gt 0) {
     Log "Found existing Splashtop products: $($productCodes -join ', ')"
@@ -86,11 +90,36 @@ try {
     Log "No existing Splashtop installation detected."
   }
 
-  # 2) Download MSI (fresh)
+  # 2) Download via BITS with retry
   New-Item -Path $BaseDir -ItemType Directory -Force | Out-Null
-  Log "Downloading -> $MsiPath"
-  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-  Invoke-WebRequest -Uri $Url -OutFile $MsiPath -UseBasicParsing
+
+  $maxAttempts = 3
+  $downloaded = $false
+
+  for ($i = 1; $i -le $maxAttempts; $i++) {
+    try {
+      Log "Downloading (attempt $i/$maxAttempts) via BITS -> $MsiPath"
+
+      Start-BitsTransfer -Source $Url -Destination $MsiPath -ErrorAction Stop
+
+      if (Test-Path $MsiPath -and (Get-Item $MsiPath).Length -gt 0) {
+        Log "Download successful"
+        $downloaded = $true
+        break
+      }
+      else {
+        throw "Downloaded file is missing or empty"
+      }
+    }
+    catch {
+      Log "Download error: $($_.Exception.Message)"
+      Start-Sleep -Seconds 5
+    }
+  }
+
+  if (-not $downloaded) {
+    throw "Failed to download MSI after $maxAttempts attempts"
+  }
 
   # 3) Install
   $args = "/i `"$MsiPath`" /qn /norestart USERINFO=`"hidewindow=1,confirm_d=0`" /l*v `"$MsiLog`""
