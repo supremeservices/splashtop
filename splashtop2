@@ -1,4 +1,4 @@
-\# Splashtop Streamer deploy: uninstall broken/old installs first, then install
+# Splashtop Streamer deploy: uninstall broken/old installs first, then install
 # - Runs as SYSTEM fine
 # - Forces 64-bit msiexec (System32)
 # - Logs everything to ProgramData\Supreme\Installers\Splashtop\Logs
